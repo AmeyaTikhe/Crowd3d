@@ -91,3 +91,9 @@ Thumbs.db
 *.npy
 *.pkl
 *.pickle
+
+# CityStreet large dataset archives
+
+CityStreet/CityStreet_zip/.z01
+CityStreet/CityStreet_zip/.z02
+CityStreet/CityStreet_zip/*.zip
