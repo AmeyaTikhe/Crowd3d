@@ -1,0 +1,93 @@
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+
+# ==============================
+# Virtual environments
+# ==============================
+.crowd/
+.venv/
+venv/
+env/
+
+# ==============================
+# IDEs and editors
+# ==============================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ==============================
+# Environment variables / secrets
+# ==============================
+.env
+.env.*
+!.env.example
+
+# ==============================
+# Generated outputs
+# ==============================
+crowd3d_outputs/
+eval_outputs/
+image_outputs/
+video_outputs/
+outputs/
+runs/
+wandb/
+
+# ==============================
+# Logs and temporary files
+# ==============================
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# ==============================
+# Python notebooks / checkpoints
+# ==============================
+.ipynb_checkpoints/
+*.pth
+*.pt
+*.onnx
+*.engine
+*.ckpt
+*.h5
+*.hdf5
+
+# ==============================
+# Large datasets and video files
+# ==============================
+# Keep dataset annotations/configuration tracked if needed
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.7z
+*.rar
+
+# ==============================
+# Generated visualizations
+# ==============================
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+
+# ==============================
+# Local machine-specific files
+# ==============================
+*.npz
+*.npy
+*.pkl
+*.pickle
