@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import re
 import sys
+import threading
 import time
 import types
 from dataclasses import replace
@@ -131,10 +133,10 @@ class Live:
             p = sum(len(self.points(v, *dets[(f, v)])) for f in tune)
             self.scale[v] = g / p if g and p else 1.0
 
-    def step(self, fid, imgs, elapsed):
+    def step(self, fid, imgs, dets, elapsed, idx=0, total=0, buf=0):
         a = self.args
         for v in self.views:
-            b, s = self.get_dets(fid, v, imgs[v])
+            b, s = dets[v]
             new = self.scale[v] * ground_density(self.points(v, b, s), self.grid, a.sigma)
             old = self.maps.get(v)
             self.maps[v] = new if old is None or a.smooth <= 0 else (1 - a.smooth) * new + a.smooth * old
@@ -153,7 +155,7 @@ class Live:
             self.mode = a.mode
         self.history.append(count)
         gt_n = len(self.ds.gt_points(fid)) if len(self.ds.gt()) else 0
-        return self.render(fid, imgs, fused, dict(count=count, p90=p90, peak=peak, gt=gt_n, sec=elapsed))
+        return self.render(fid, imgs, fused, dict(count=count, p90=p90, peak=peak, gt=gt_n, sec=elapsed, idx=idx, total=total, buf=buf))
 
     def ref_of(self, d):
         return np.sort(d[self.mask & (d >= ev.OCCUPIED)])
@@ -201,7 +203,9 @@ class Live:
 
         panel = np.full((height, PANEL_W, 3), 35, np.uint8)
         y = 30
-        for s, sc, col in ((f"frame {fid}", 0.7, (255, 255, 255)), (f"processing {st['sec']:.1f} s/frame", 0.5, (180, 180, 180)),
+        prog = f"  ({st['idx']}/{st['total']})" if st["total"] else ""
+        for s, sc, col in ((f"frame {fid}{prog}", 0.7, (255, 255, 255)),
+                           (f"detection {st['sec']:.1f} s/frame" + (f", {st['buf']} frames buffered" if getattr(a, "prefetch", 0) > 0 else ""), 0.5, (180, 180, 180)),
                            (f"scale: {mode}" + (" (auto)" if a.mode == "auto" else ""), 0.6, (80, 220, 255)),
                            (f"people (fused): {st['count']:.0f}", 0.7, (255, 255, 255)),
                            (f"ground truth: {st['gt']}" if st["gt"] else "ground truth: n/a", 0.55, (180, 180, 180)),
@@ -255,74 +259,160 @@ def build_detector(args, ds):
     os.makedirs(ev.CACHE_DIR, exist_ok=True)
     holder = {}
 
+    def path(fid, v):
+        return os.path.join(ev.CACHE_DIR, f"{tag}_{fid}_{v}.npz")
+
+    def cached(fid, v):
+        return os.path.exists(path(fid, v))
+
     def get_dets(fid, v, img):
-        p = os.path.join(ev.CACHE_DIR, f"{tag}_{fid}_{v}.npz")
-        if os.path.exists(p):
-            d = np.load(p)
+        if cached(fid, v):
+            d = np.load(path(fid, v))
             return d["boxes"], d["scores"]
         if "det" not in holder:
             holder["det"] = PersonDetector(cfg)
         b, s = holder["det"].detect(img, ds.roi.get(v))
-        np.savez(p, boxes=b, scores=s)
+        np.savez(path(fid, v), boxes=b, scores=s)
         return b, s
 
-    return cfg, get_dets
+    return cfg, get_dets, cached
 
 
-def run(args, ds, source, get_dets, calib=None):
+def precompute(ds, ids, get_dets, cached):
+    todo = [f for f in ids if not all(cached(f, v) for v in ds.cameras)]
+    print(f"{len(ids)} frames selected, {len(todo)} still need detection (the rest are already cached)")
+    t0 = time.time()
+    for k, fid in enumerate(todo, 1):
+        imgs = ds.load_frame_images(fid)
+        for v in ds.cameras:
+            get_dets(fid, v, imgs[v])
+        el = time.time() - t0
+        print(f"[{k}/{len(todo)}] frame {fid} | {el / k:.1f} s per frame | about {(len(todo) - k) * el / k / 60:.0f} min left", flush=True)
+
+
+def run(args, ds, source, get_dets, calib=None, total=0):
     live = Live(ds, args, get_dets)
     if calib:
         live.calibrate(*calib)
         print("count correction per camera: " + ", ".join(f"{v} x{s:.2f}" for v, s in live.scale.items()))
-    writer, window_ok, paused, n = None, not args.no_window, False, 0
+    stop = threading.Event()
+    prefetch = getattr(args, "prefetch", 0)
+    q, it = None, None
+    if prefetch > 0:
+        q = queue.Queue(maxsize=prefetch)
+
+        def worker():
+            try:
+                for fid, imgs in source:
+                    if stop.is_set():
+                        return
+                    t0 = time.time()
+                    dets = {v: get_dets(fid, v, imgs[v]) for v in live.views}
+                    q.put((fid, imgs, dets, time.time() - t0))
+                q.put(None)
+            except Exception as e:
+                q.put(e)
+
+        threading.Thread(target=worker, daemon=True).start()
+    else:
+        def sync_items():
+            for fid, imgs in source:
+                t0 = time.time()
+                yield fid, imgs, {v: get_dets(fid, v, imgs[v]) for v in live.views}, time.time() - t0
+
+        it = sync_items()
+
+    state = dict(writer=None, window=not args.no_window, paused=False, fid=0)
+    last = {"canvas": None}
+
+    def ui(canvas):
+        if not state["window"]:
+            return False
+        try:
+            cv2.imshow("crowd heatmap", canvas)
+            key = cv2.waitKey(1) & 0xFF
+        except cv2.error:
+            print("No display available (this OpenCV build has no window support); continuing without a window.")
+            state["window"] = False
+            return False
+        if key in (ord("q"), 27):
+            return True
+        if key == ord(" "):
+            state["paused"] = not state["paused"]
+        if key == ord("m") and args.mode == "auto":
+            live.mode = "relative" if live.mode == "absolute" else "absolute"
+        if key == ord("s"):
+            out = os.path.join(ev.OUT_DIR, f"live_snapshot_{state['fid']}.png")
+            os.makedirs(ev.OUT_DIR, exist_ok=True)
+            cv2.imwrite(out, canvas)
+            print(f"saved {out}")
+        return False
+
+    def waiting_canvas():
+        base = last["canvas"].copy() if last["canvas"] is not None else np.zeros((360, 900, 3), np.uint8)
+        text(base, "waiting for YOLO detection on the next frame...", (20, base.shape[0] - 20), 0.8, (80, 220, 255), 2)
+        return base
+
+    def fetch():
+        if q is None:
+            nxt = next(it, None)
+            return ("end", None) if nxt is None else ("item", nxt)
+        while True:
+            try:
+                nxt = q.get(timeout=0.05)
+            except queue.Empty:
+                if ui(waiting_canvas()):
+                    return ("quit", None)
+                continue
+            if nxt is None:
+                return ("end", None)
+            if isinstance(nxt, Exception):
+                return ("error", nxt)
+            return ("item", nxt)
+
     period = 1.0 / args.fps if args.fps > 0 else 0.0
-    it = iter(source)
-    last = None
+    n, reason = 0, "end of the frames"
     while True:
         t0 = time.time()
-        if not paused or last is None:
-            try:
-                fid, imgs = next(it)
-            except StopIteration:
+        if not state["paused"] or last["canvas"] is None:
+            kind, data = fetch()
+            if kind == "quit":
+                reason = "q pressed"
                 break
-            canvas = live.step(fid, imgs, time.time() - t0)
+            if kind == "end":
+                reason = f"reached the end of the {n} frames"
+                break
+            if kind == "error":
+                stop.set()
+                raise data
+            fid, imgs, dets, sec = data
+            canvas = live.step(fid, imgs, dets, sec, idx=n + 1, total=total, buf=q.qsize() if q else 0)
+            if args.display_scale != 1.0:
+                canvas = cv2.resize(canvas, None, fx=args.display_scale, fy=args.display_scale, interpolation=cv2.INTER_AREA)
+            last["canvas"], state["fid"] = canvas, fid
             n += 1
-            last = (fid, canvas)
-        fid, canvas = last
-        if args.display_scale != 1.0:
-            canvas = cv2.resize(canvas, None, fx=args.display_scale, fy=args.display_scale, interpolation=cv2.INTER_AREA)
-        if args.save and writer is None:
-            writer = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"), max(args.fps, 1.0), (canvas.shape[1], canvas.shape[0]))
-        if writer is not None and not paused:
-            writer.write(canvas)
-        if window_ok:
-            try:
-                cv2.imshow("crowd heatmap", canvas)
-                key = cv2.waitKey(1) & 0xFF
-            except cv2.error:
-                print("No display available (this OpenCV build has no window support); continuing without a window.")
-                window_ok, key = False, 255
-            if key in (ord("q"), 27):
-                break
-            if key == ord(" "):
-                paused = not paused
-            if key == ord("m") and args.mode == "auto":
-                live.mode = "relative" if live.mode == "absolute" else "absolute"
-            if key == ord("s"):
-                out = os.path.join(ev.OUT_DIR, f"live_snapshot_{fid}.png")
-                os.makedirs(ev.OUT_DIR, exist_ok=True)
-                cv2.imwrite(out, canvas)
-                print(f"saved {out}")
+            if n == 1 or n % 10 == 0:
+                print(f"frame {fid} shown ({n}{'/' + str(total) if total else ''}) | detection {sec:.1f} s | buffered {q.qsize() if q else 0}", flush=True)
+            if args.save and state["writer"] is None:
+                state["writer"] = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"), max(args.fps, 1.0), (canvas.shape[1], canvas.shape[0]))
+            if state["writer"] is not None:
+                state["writer"].write(canvas)
+        if ui(last["canvas"]):
+            reason = "q pressed"
+            break
         if args.max_frames and n >= args.max_frames:
+            reason = "--max-frames reached"
             break
         rest = period - (time.time() - t0)
         if rest > 0:
             time.sleep(rest)
-    if writer is not None:
-        writer.release()
+    stop.set()
+    if state["writer"] is not None:
+        state["writer"].release()
         print(f"video saved to {args.save}")
-    if window_ok:
+    if state["window"]:
         cv2.destroyAllWindows()
+    print(f"stopped: {reason} | {n} frames shown")
 
 
 def main():
@@ -332,7 +422,10 @@ def main():
     ap.add_argument("--video-skip", type=int, default=1)
     ap.add_argument("--frames", default=f"{ev.TEST_RANGE[0]}:{ev.TEST_RANGE[1]}", help="START:END or a comma list of frame numbers")
     ap.add_argument("--step", type=int, default=2)
-    ap.add_argument("--fps", type=float, default=2.0, help="cap on playback speed; slower if detection is slower")
+    ap.add_argument("--fps", type=float, default=10.0, help="cap on playback speed; slower if detection is slower")
+    ap.add_argument("--prefetch", type=int, default=6, help="frames detected ahead in a background thread (0 = off)")
+    ap.add_argument("--precompute", action="store_true", help="detect all selected frames first (with progress and time left), then play")
+    ap.add_argument("--loop", action="store_true", help="start again when the frames run out")
     ap.add_argument("--conf", type=float, default=0.10)
     ap.add_argument("--point", choices=list(POINT_MODES), default="mid")
     ap.add_argument("--sigma", type=float, default=1.0)
@@ -354,7 +447,7 @@ def main():
 
     ds = CityStreetData(args.data_root)
     ds.cameras = {v: replace(c, dist_model=args.dist_model) for v, c in ds.cameras.items()}
-    cfg, get_dets = build_detector(args, ds)
+    cfg, get_dets, cached = build_detector(args, ds)
     calib = None
     if not args.no_calibrate and len(ds.gt()):
         ns = types.SimpleNamespace(tune_frames="", n_tune=4, test_frames="", n_test=8)
@@ -362,15 +455,30 @@ def main():
         if tune:
             dets, _ = ev.detect_all(ds, cfg, tune, True)
             calib = (tune, dets)
+    total = 0
     if args.videos:
         source = video_source(args.videos, list(ds.cameras), args.video_skip)
     else:
         ids = list_frame_ids(ds, args.frames, args.step)
         if not ids:
             sys.exit("No frames found for that range.")
-        print(f"{len(ids)} frames from {ids[0]} to {ids[-1]} | keys: q quit, space pause, m switch scale, s snapshot")
-        source = dataset_source(ds, ids)
-    run(args, ds, source, get_dets, calib)
+        todo = [f for f in ids if not all(cached(f, v) for v in ds.cameras)]
+        print(f"{len(ids)} frames from {ids[0]} to {ids[-1]}; {len(todo)} of them still need YOLO detection | keys: q quit, space pause, m switch scale, s snapshot")
+        if args.precompute:
+            precompute(ds, ids, get_dets, cached)
+        elif todo:
+            print("tip: add --precompute to detect everything first, or --fast for a quicker model")
+        total = len(ids)
+
+        def make():
+            return dataset_source(ds, ids)
+
+        def looped():
+            while True:
+                yield from make()
+
+        source = looped() if args.loop else make()
+    run(args, ds, source, get_dets, calib, total=0 if args.videos else total)
 
 
 if __name__ == "__main__":
